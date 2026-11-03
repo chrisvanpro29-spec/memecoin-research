@@ -6,6 +6,10 @@ A chaque execution :
      -> data/pools/AAAA-MM-JJ.csv
   2. revient sur les pools deja vues a +1h, +6h, +24h, +7j pour noter leur etat
      -> data/snapshots/AAAA-MM-JJ.csv
+  3. pour un echantillon aleatoire de pools agees de 1h a 3h, telecharge le flux
+     de trades (300 derniers : wallet, achat/vente, montant, heure)
+     -> data/trades/AAAA-MM-JJ/HHMM.csv.gz      (un fichier par execution)
+     -> data/trades_index/AAAA-MM-JJ.csv        (une ligne par pool : couverture)
 
 Aucune dependance externe (bibliotheque standard Python uniquement).
 Respecte la limite GeckoTerminal (~30 requetes/minute).
@@ -13,8 +17,10 @@ Respecte la limite GeckoTerminal (~30 requetes/minute).
 import csv
 import datetime as dt
 import glob
+import gzip
 import json
 import os
+import random
 import time
 import urllib.error
 import urllib.request
@@ -27,6 +33,8 @@ MIN_INTERVAL = 2.2                                  # secondes entre deux requet
 TIME_BUDGET = int(os.getenv("TIME_BUDGET", "480"))  # secondes max par execution
 CHECKPOINTS = [("1h", 1), ("6h", 6), ("24h", 24), ("7d", 168)]
 LOOKBACK_DAYS = 9
+TRADES_PER_RUN = int(os.getenv("TRADES_PER_RUN", "15"))  # pools dont on capture le flux, par execution
+TRADES_AGE_H = (1.0, 3.0)                                 # fenetre d'age pour la capture du flux
 
 FIELDS = [
     "pool", "name", "base_token", "dex", "created_at",
@@ -39,6 +47,9 @@ FIELDS = [
 ]
 POOL_COLS = ["seen_at", "age_min_at_seen"] + FIELDS
 SNAP_COLS = ["observed_at", "checkpoint", "age_h", "late", "status"] + FIELDS
+TRADE_COLS = ["pool", "ts", "kind", "wallet", "usd", "token_amount", "price_usd", "block", "tx"]
+INDEX_COLS = ["pool", "fetched_at", "age_h", "n_trades", "first_ts", "last_ts",
+              "covers_launch", "n_wallets", "status"]
 
 _last_call = 0.0
 _start = time.time()
@@ -211,14 +222,86 @@ def collect_snapshots(due):
     return len(rows)
 
 
+def flatten_trade(pool, t):
+    a = t.get("attributes") or {}
+    kind = a.get("kind")
+    # achat : on recoit le token ; vente : on le donne
+    amount = a.get("to_token_amount") if kind == "buy" else a.get("from_token_amount")
+    price = a.get("price_to_in_usd") if kind == "buy" else a.get("price_from_in_usd")
+    return {
+        "pool": pool,
+        "ts": a.get("block_timestamp"),
+        "kind": kind,
+        "wallet": a.get("tx_from_address"),
+        "usd": a.get("volume_in_usd"),
+        "token_amount": amount,
+        "price_usd": price,
+        "block": a.get("block_number"),
+        "tx": a.get("tx_hash"),
+    }
+
+
+def collect_trades(known, traded):
+    """Echantillon aleatoire (donc sans biais de selection) de pools agees de 1h a 3h."""
+    now = now_utc()
+    candidates = []
+    for pool, created_s in known.items():
+        created = parse_ts(created_s)
+        if not created or pool in traded:
+            continue
+        age_h = (now - created).total_seconds() / 3600
+        if TRADES_AGE_H[0] <= age_h <= TRADES_AGE_H[1]:
+            candidates.append((pool, created, age_h))
+    random.shuffle(candidates)
+
+    trade_rows, index_rows = [], []
+    for pool, created, age_h in candidates[:TRADES_PER_RUN]:
+        if out_of_time():
+            break
+        res = api_get(f"/networks/{NETWORK}/pools/{pool}/trades")
+        if res is None:
+            index_rows.append({"pool": pool, "fetched_at": now.isoformat(timespec="seconds"),
+                               "age_h": round(age_h, 2), "status": "error"})
+            continue
+        rows = [flatten_trade(pool, t) for t in res.get("data") or []]
+        stamps = sorted(r["ts"] for r in rows if r["ts"])
+        first = parse_ts(stamps[0]) if stamps else None
+        trade_rows.extend(rows)
+        index_rows.append({
+            "pool": pool,
+            "fetched_at": now.isoformat(timespec="seconds"),
+            "age_h": round(age_h, 2),
+            "n_trades": len(rows),
+            "first_ts": stamps[0] if stamps else "",
+            "last_ts": stamps[-1] if stamps else "",
+            # le flux couvre-t-il les 5 premieres minutes du token ?
+            "covers_launch": int(bool(first) and (first - created).total_seconds() <= 300),
+            "n_wallets": len({r["wallet"] for r in rows if r["wallet"]}),
+            "status": "ok",
+        })
+        traded.add(pool)
+
+    if trade_rows:
+        path = os.path.join(DATA, "trades", now.strftime("%Y-%m-%d"), now.strftime("%H%M") + ".csv.gz")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with gzip.open(path, "wt", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=TRADE_COLS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(trade_rows)
+    append_rows("trades_index", INDEX_COLS, index_rows)
+    return len(index_rows), len(trade_rows)
+
+
 def main():
     known = {r["pool"]: r["created_at"] for r in read_recent("pools")}
     done = {(r["pool"], r["checkpoint"]) for r in read_recent("snapshots")}
     n_new = collect_new(known)
     due = due_checkpoints(known, done)
     n_snap = collect_snapshots(due)
+    traded = {r["pool"] for r in read_recent("trades_index")}
+    n_tp, n_tr = collect_trades(known, traded)
     print(f"Nouvelles pools: {n_new} | checkpoints dus: {len(due)} | enregistres: {n_snap} "
-          f"| duree: {time.time() - _start:.0f}s")
+          f"| flux captes: {n_tp} pools / {n_tr} trades | duree: {time.time() - _start:.0f}s")
 
 
 if __name__ == "__main__":
